@@ -1,0 +1,58 @@
+#!/bin/bash
+
+reference_file="$1"
+reference_dir=$2 ### "/dados/takeabreakpipeline/Joao_Pipeline/tosimulateinversions"
+begin=$3
+end=$4
+sequence_size1=$5
+sequence_size2=$6
+rate_mutations=$7
+fraction_indels=$8
+prob_indel=$9
+error_rate=$10
+standard_deviation=$11
+read_pairs=$12
+seed=$13
+
+if [ $sequence_size1 == "s" ]; then
+	echo "Using standard parameters to create simulated reads"
+	sequence_size1=300
+	sequence_size2=300
+	rate_mutations=0.010
+	fraction_indels=0.15
+	prob_indel=0.30
+	error_rate=0.02
+	standard_deviation=50
+	read_pairs=10000000
+	seed=0
+fi
+
+echo "Formatting input data"
+docker run --rm -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock -v $reference_dir:/$reference_dir pegi3s/utilities fasta_remove_line_breaks $reference_dir/$reference_file -o=$reference_dir/reference_file_out 
+rm  /data/$reference_file && mv /data/reference_file_out /data/$reference_file
+head -2 /data/$reference_file > /data/tmp && rm /data/$reference_file && mv /data/tmp /data/$reference_file
+
+echo "Creating the inversion"
+# Extrair as regiões iniciais e finais
+grep -v ">" /data/$reference_file > /data/tmp
+header=$(grep ">" /data/$reference_file)
+normal_end=$(($begin - 1))
+tmp_initial=$(cat /data/tmp| cut -c 1-$normal_end)
+normal_begin=$(($end + 1))
+tmp_end=$(cat /data/tmp| cut -c $normal_begin-)
+
+# Extrair a região invertida uma vez
+docker run --rm -v "$reference_dir":/data pegi3s/emboss revseq -sequence /data/"$reference_file" -sbegin1 $begin -send1 $end -outseq /data/inv > /dev/null 2>&1
+tmp_inv=$(cat /data/inv | grep -v ">")
+final_seq=$(echo $tmp_initial $tmp_inv $tmp_end | sed 's/ //g')
+echo $header" Sequence inverted between "$begin" and "$end > /data/inverted
+echo $final_seq >> /data/inverted
+sed -i 's/ /_/g' /data/inverted
+rm /data/tmp /data/inv
+
+echo "Simulating reads for the reference genome; It only works for sequences larger than 650 bp"
+docker run --rm -v $reference_dir:/data pegi3s/samtools_bcftools wgsim -1 $sequence_size1 -2 $sequence_size2 -r $rate_mutations -R $fraction_indels -X $prob_indel -e $error_rate -s $standard_deviation -N $read_pairs -S $seed /data/inverted /data/inverted_simulated_reads1 /data/inverted_simulated_reads2 &> /dev/null
+cat /data/inverted_simulated_reads1 /data/inverted_simulated_reads2 > /data/inverted_simulated_reads
+rm /data/inverted_simulated_reads1 /data/inverted_simulated_reads2 
+
+

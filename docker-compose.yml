@@ -1,0 +1,7 @@
+version: "3.3"
+services:
+  seda:
+    image: pegi3s/dib
+    build:
+      context: ./
+      dockerfile: Dockerfile

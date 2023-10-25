@@ -1,0 +1,172 @@
+#!/bin/bash
+. /data/config
+
+echo""
+#----------------------------------------------------------------------------Wget Ref------------------------------------------------------------------------
+
+if [ $get_reference == "Y" ] || [ $get_reference == "y" ]; then
+	echo "Getting reference genome" 
+	a1=$(echo $reference | cut -c1-3)
+	a2=$(echo $reference | cut -c5-7)
+	a3=$(echo $reference | cut -c8-10)
+	a4=$(echo $reference | cut -c11-13)
+	a=$(echo "https://ftp.ncbi.nlm.nih.gov/genomes/all/"$a1"/"$a2"/"$a3"/"$a4"/")
+	mkdir -p /data/reference_file
+	cd /data/reference_file
+	wget $a /data/reference_file &> /dev/null
+	grep "$reference" index.html > tmp1
+	rm index.html
+	cut -f1 -d'/' tmp1 > tmp0
+	rm tmp1
+	sed -i 's/<a href\=\"//g' tmp0
+	b=$(cat tmp0)
+	rm tmp0
+	command=$(echo $a$b"/"$b"_genomic.fna.gz")
+	wget $command /data/reference_file &> /dev/null
+	gunzip $reference* &> /dev/null
+	reference=$(echo "$b"_genomic.fna)
+fi
+
+#---------------------------------------------------------------------------------Wgsim----------------------------------------------------------------------------
+
+echo "Simulating reads for the reference genome"
+mkdir -p /data/tmp/wgsim_extract /data/tmp/simulated_reads
+cp /data/reference_file/$reference /data/tmp/wgsim_extract
+cd /data/tmp/wgsim_extract
+docker run --rm -v $dir:/data pegi3s/samtools_bcftools wgsim -1 $sequence_size1 -2 $sequence_size2 -r $rate_mutations -R $fraction_indels -X $prob_indel -e $error_rate -s $standard_deviation -N $read_pairs -S $seed /data/tmp/wgsim_extract/$reference /data/tmp/simulated_reads/simulated1 /data/tmp/simulated_reads/simulated2 &> /dev/null
+cat /data/tmp/simulated_reads/simulated1 /data/tmp/simulated_reads/simulated2 > /data/tmp/simulated_reads/simulated_genome
+
+rm /data/tmp/wgsim_extract/$reference /data/tmp/simulated_reads/simulated1 /data/tmp/simulated_reads/simulated2
+rmdir /data/tmp/wgsim_extract/
+
+#-------------------------------------------------------------------------------GetSRR-----------------------------------------------------------------------------
+
+if [ -z "$list" ]; then
+	true
+else
+	mkdir -p /data/SRR_data
+	cd /data/SRR_data
+	while read name; do
+		echo "Getting sample "$name
+		a1=$(echo $name | cut -c1-6)
+		a2=$(echo $name | cut -c10)
+		command=$(echo "ftp://ftp.sra.ebi.ac.uk/vol1/fastq/"$a1"/00"$a2"/"$name"/"$name""*".fastq.gz")
+		wget $command &> /dev/null
+		gunzip $name* &> /dev/null
+		cat  $name*fastq > $name.fastq.tmp
+		rm  $name*fastq && mv $name.fastq.tmp $name.fastq
+	done < /data/$list
+	format="fastq"
+fi
+
+# Loop thrue all the samples in the SRR_data folder
+ls /data/SRR_data/* > /data/SRR_data/sample_list && sed -i 's/^\/data\/SRR_data\///g'  /data/SRR_data/sample_list
+cd /data
+
+while read SRRfile; do
+
+#-------------------------------------------------------------------------------AfterQC------------------------------------------------------------------------
+
+	
+	if [ $format == "fastq" ]; then
+		echo "Running AfterQC on sample "$SRRfile". Please be patient"
+		docker run --rm -v $dir/SRR_data:/data pegi3s/afterqc bash -c "cd /data && after.py -1 /data/$SRRfile" &> /dev/null
+		rm /data/SRR_data/$SRRfile
+		cp /data/SRR_data/good/*.good.fq /data/SRR_data/$SRRfile
+		rm -r /data/SRR_data/good /data/SRR_data/bad /data/SRR_data/QC
+		docker run --rm -v $dir/SRR_data:/data pegi3s/utilities fastq_to_fasta /data/$SRRfile /data/$SRRfile.fa &> /dev/null
+		rm /data/SRR_data/$SRRfile
+	elif 	[ $format == "fasta" ]; then
+		true
+	elif [ $format != "fasta" ] || [ $format != "fastq" ]; then
+		echo "Please select a file format in the config file" && exit
+	fi
+
+
+#-------------------------------------------------------------------------------TakeaBreak------------------------------------------------------------------------
+
+echo "Running Take_A_Break"
+mkdir -p /data/tmp/take_a_break_output
+docker run --rm -v $dir:/data pegi3s/takeabreak bash -c "./TakeABreak -in /data/SRR_data/$SRRfile,/data/tmp/simulated_reads/simulated_genome -out /data/tmp/take_a_break_output/take_a_break_output"  &> /dev/null
+
+#-------------------------------------------------------------------------------First Val-----------------------------------------------------------------------
+
+echo "Running Blastn to select cases where identity is above "$seq_ident"%, there are less than "$gen_hits" hits in reference genome, and all four sequence types have been identified"
+mkdir -p /data/tmp/take_a_break_extract /data/tmp/blast_output /data/tmp/first_val_output 
+cp /data/reference_file/$reference /data/tmp/take_a_break_extract
+cp /data/tmp/take_a_break_output/take_a_break_output.fasta /data/tmp/take_a_break_extract
+
+cd /data/tmp/take_a_break_extract
+docker run --rm -v $dir/tmp/take_a_break_extract:/data pegi3s/blast makeblastdb -in /data/$reference -dbtype nucl -parse_seqids &> /dev/null
+docker run --rm -v $dir/tmp/take_a_break_extract:/data pegi3s/blast blastn -query /data/take_a_break_output.fasta -db /data/$reference -evalue 0.05 -outfmt 6 -out /data/tmp1
+cp /data/tmp/take_a_break_extract/tmp1 /data/tmp/blast_output/full_blastn_output
+## The output is query id, subject id, %identical positions(>98%), align length, start align subject, end alig subject
+awk -v seq_ident=$seq_ident -v align_length=$align_length '{ if(($3 > seq_ident) && ($4 > align_length)) {print $1,$2,$3,$4,$9,$10}}' /data/tmp/take_a_break_extract/tmp1 > /data/tmp/blast_output/blastn_output
+rm /data/tmp/take_a_break_extract/tmp1
+while read header; do
+	read seq
+	header1=$(echo $header | sed 's/>//g')
+	if grep -q "$header1" /data/tmp/blast_output/blastn_output ; then
+   		echo $header "Found in reference genome" >> /data/tmp/first_val_output/val_results
+   		echo $seq >> /data/tmp/first_val_output/val_results
+   		echo $header "Found in reference genome" >> /data/tmp/first_val_output/tmp2
+   		echo $seq >> /data/tmp/first_val_output/tmp2
+	else
+    		echo $header "Not found in reference genome" >> /data/tmp/first_val_output/val_results
+    		echo $seq >> /data/tmp/first_val_output/val_results
+	fi
+done < /data/tmp/take_a_break_extract/take_a_break_output.fasta
+
+	grep '>' /data/tmp/first_val_output/tmp2 | grep -oh "_[0-9]*|"  | sort -u > /data/tmp/first_val_output/found_names_list
+
+while read line; do
+	line1=$(echo $line | cut -f2 -d'-' | cut -f2 -d'_' | cut -f1 -d'|')
+
+	a=$(grep -c "_"$line1"|" /data/tmp/blast_output/blastn_output)
+	
+	i=0
+	grep "_v-b_" /data/tmp/first_val_output/val_results | grep "_"$line1"|" >  /data/tmp/first_val_output/tmp3
+	grep "_a-vbar_" /data/tmp/first_val_output/val_results | grep "_"$line1"|" >  /data/tmp/first_val_output/tmp4
+	grep "_ubar-b_" /data/tmp/first_val_output/val_results | grep "_"$line1"|" >  /data/tmp/first_val_output/tmp5
+	grep "_a-u_" /data/tmp/first_val_output/val_results | grep "_"$line1"|" >  /data/tmp/first_val_output/tmp6
+	
+	if grep -q ">" /data/tmp/first_val_output/tmp3; then
+		i=$(( i + 1 ))
+	fi
+		if grep -q ">" /data/tmp/first_val_output/tmp4; then
+		i=$(( i + 1 ))
+	fi
+		if grep -q ">" /data/tmp/first_val_output/tmp5; then
+		i=$(( i + 1 ))
+	fi
+		if grep -q ">" /data/tmp/first_val_output/tmp6; then
+		i=$(( i + 1 ))
+	fi
+	rm /data/tmp/first_val_output/tmp*
+	
+	if [ $a -le $gen_hits ] && [ $i -eq 4 ] ; then
+		grep  -A1 "_"$line1"|" /data/tmp/first_val_output/val_results >> /data/tmp/first_val_output/val_results_filtered
+	fi
+	touch /data/tmp/first_val_output/val_results_filtered
+
+	while read header; do
+		read seq
+		c=""
+		d=""
+		c=$(echo $header | cut -f1 -d' ' | sed 's/>//g')
+		d=$(grep -F $c /data/tmp/blast_output/blastn_output | tr '\n' ' '  | sed 's/|/_/g')
+		if [ -z "$d" ]; then
+			d=$(echo $c | sed 's/|/_/g')
+		fi
+		sed -i "s/$c/$d/g"  /data/tmp/first_val_output/val_results_filtered
+	done <  /data/tmp/first_val_output/val_results_filtered
+
+done < /data/tmp/first_val_output/found_names_list
+cp /data/tmp/first_val_output/val_results_filtered /data/results.$SRRfile
+
+rm -r /data/tmp/blast_output /data/tmp/first_val_output  /data/tmp/take_a_break_extract /data/tmp/take_a_break_output
+done < /data/SRR_data/sample_list
+rm /data/SRR_data/sample_list
+rm -r /data/tmp
+
+
